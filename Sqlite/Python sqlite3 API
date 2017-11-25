@@ -1,0 +1,52 @@
+simply list the frequently-used APIs of sqlite3 in python
+
+1. sqlite3.connect(database, timeout, other optional arguments)
+Open a sqlite database file, if does not exist, will create one. when a database is accessed by multiple connections,
+and one of the process modifies the database, the sqlite database is locked until that transaction is committed.
+The timeout parameter specifies how long the connection should wait for the lock to go away until raising an exception.
+The default for the timeout parameter is 5.0 (five seconds).
+
+2.connection.cursor()
+Create a cursor
+
+3. cursor.execute(sql, optional parameters)
+Execute a sql statement. The sql statement can be parameterization, use '?' to be a placeholder
+
+4. connection.execute(sql, optional parameter)
+Simply do not use cursor to execute a sql statement
+
+5. cursor.executemany(sql, sql_of_parameters)
+Execute a sql statement for all the sql_of_parameters
+
+6. connection.executemany(sql, sql_of_parameters)
+Simply do not use cursor to execute
+
+7. cursor.executescript(sql_script)
+Execute a SQL script. It will first execute COMMIT statement, and then execute the sql_script. All SQL statement should
+be separated by ';'
+
+8. connection.execute(sql_script)
+Simply do not use cursor to execute
+
+9. connection.total_changes()
+returns all rows since open databasse's connection
+
+10. connection.commit()
+Commit current transaction. If you do not call this function, all your action after last commit() is sightless to other
+database connections.
+
+11. connection.rollback()
+Roll back all changes to database since last commit()
+
+12. connection.close()
+Close connection to database. Note that this function will not call commit(), if you do not call commit() before, all
+your actions to database will lose.
+
+13. cursor.fetchone()
+Return the next line of search result set, returns a single sequence. When there is no more data, return None.
+
+14. cursor.fetchmany([size=cursor.arraysize[)
+Return next many lines of search result set, returns a list. When no more available lines, will return a empty list.
+
+15. cursor.fetchall()
+Return all lines of search result set, returns a list. When no available rows, return a empty list.
