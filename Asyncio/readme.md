@@ -704,3 +704,292 @@ done with phase 0
 received answer phase 0 result
 results: ['phase 2 result', 'phase 1 result', 'phase 0 result']
 ```
+
+# 同步原语
+
+虽然 asyncio 应用一般是单线程程序，但是它们仍然是并发应用。受 I/O 中断或者外部事件的影响，每一个 coroutine 或者 task 都可能以一种不可预测的顺序执行。为了支持更加安全的并发，asyncio 实现了一些 threading 和 multiprocessing 模块中比较常用的类似的同步原语。
+
+## Lock
+
+Lock 可以用来安全的访问共享资源
+
+```py
+# asyncio_lock.py
+import asyncio
+import functools
+
+
+def unlock(lock):
+    """:type lock asyncio.Lock"""
+    print('callback releasing lock')
+    lock.release()
+
+
+async def coroutine1(lock):
+    """:type lock asyncio.Lock"""
+    print('coroutine 1 waiting for the lock')
+    with await lock:
+        print('coroutine 1 acquired lock')
+    print('coroutine 1 released lock')
+
+
+async def coroutine2(lock):
+    """:type lock asyncio.Lock"""
+    print('coroutine 2 waiting for the lock')
+    await lock
+    print('coroutine 2 acquired lock')
+    print('coroutine 2 released lock')
+    lock.release()
+
+
+async def main(loop):
+    lock = asyncio.Lock()
+    print('acquiring the lock before starting coroutines')
+    await lock.acquire()
+    print('lock acquired: {}'.format(lock.locked()))
+
+    loop.call_later(0.1, functools.partial(unlock, lock))
+
+    print('waiting for coroutines')
+    await asyncio.wait([
+        coroutine1(lock),
+        coroutine2(lock),
+    ])
+
+
+event_loop = asyncio.get_event_loop()
+event_loop.run_until_complete(main(event_loop))
+event_loop.close()
+```
+
+可以使用 await 来获取锁，使用 `release` 方法来释放锁。也可以使用 `with await` 上下文语句来获取和释放锁。
+
+```
+acquiring the lock before starting coroutines
+lock acquired: True
+waiting for coroutines
+coroutine 1 waiting for the lock
+coroutine 2 waiting for the lock
+callback releasing lock
+coroutine 1 acquired lock
+coroutine 1 released lock
+coroutine 2 acquired lock
+coroutine 2 released lock
+```
+
+## Event
+
+`asyncio.Event` 基于 `threading.Event`，用来允许多个消费者等待某个事件发生，而不用去监听某个特殊的值来实现类似通知的功能。
+
+```py
+# asyncio_event.py
+import asyncio
+import functools
+
+
+def set_event(event):
+    """:type event asyncio.Event"""
+    print('setting event in callback')
+    event.set()
+
+
+async def coroutine1(event):
+    """:type event asyncio.Event"""
+    print('coroutine 1 waiting for event')
+    await event.wait()
+    print('coroutine 1 triggered')
+
+
+async def coroutine2(event):
+    """:type event asyncio.Event"""
+    await event.wait()
+    print('coroutine 2 triggered')
+
+
+async def main(loop):
+    event = asyncio.Event()
+    print('event start state: {}'.format(event.is_set()))
+    loop.call_later(0.1, functools.partial(set_event, event))
+    await asyncio.wait([
+        coroutine1(event),
+        coroutine2(event),
+    ])
+    print('event end state: {}'.format(event.is_set()))
+
+
+event_loop = asyncio.get_event_loop()
+event_loop.run_until_complete(main(event_loop))
+event_loop.close()
+```
+
+和 Lock 不同，coroutine 通过 `await.wait()` 方法等待事件发生。同时，event 状态一旦发生改变，通过 `wait()` 方法等待时间的代码就启动了，他们不需要对 event 对象争夺一个唯一的所有权。
+
+```
+event start state: False
+coroutine 1 waiting for event
+setting event in callback
+coroutine 2 triggered
+coroutine 1 triggered
+event end state: True
+```
+
+## Condition
+
+Condition 的效果类似 Event，不同的是它不是唤醒所有等待中的 coroutine，而是通过 `notify()` 唤醒指定数量的 待唤醒coroutine
+
+```py
+# asyncio_condition.py
+import asyncio
+
+
+async def consumer(condition, n):
+    """:type condition asyncio.Condition"""
+    with await condition:
+        print('consumer {} is waiting'.format(n))
+        await condition.wait()
+        print('consumer {} triggered'.format(n))
+    print('ending consumer {}'.format(n))
+
+
+async def manipulate_condition(condition):
+    """:type condition asyncio.Condition"""
+    print('starting manipulate condition')
+    await asyncio.sleep(0.1)
+
+    for i in range(1, 3):
+        with await condition:
+            print('notifying {} consumers'.format(i))
+            condition.notify(n=i)
+        await asyncio.sleep(0.1)
+
+    with await condition:
+        print('notifying remaining consumers')
+        condition.notify_all()
+
+    print('ending manipulate condition')
+
+
+async def main(loop):
+    condition = asyncio.Condition()
+
+    consumers = [consumer(condition, i) for i in range(5)]
+    loop.create_task(manipulate_condition(condition))
+    await asyncio.wait(consumers)
+
+
+event_loop = asyncio.get_event_loop()
+result = event_loop.run_until_complete(main(event_loop))
+event_loop.close()
+```
+
+这个例子中，我们启动了五个 Condition 的消费者，每个都使用 `condition.wait()` 方法来等待它们可以处理的通知，`manipulate_condition()` 首先通知了一个消费者，然后又通知了两个消费者，最后通知了剩下的消费者。
+
+```
+starting manipulate condition
+consumer 2 is waiting
+consumer 3 is waiting
+consumer 4 is waiting
+consumer 1 is waiting
+consumer 0 is waiting
+notifying 1 consumers
+consumer 2 triggered
+ending consumer 2
+notifying 2 consumers
+consumer 3 triggered
+ending consumer 3
+consumer 4 triggered
+ending consumer 4
+notifying remaining consumers
+ending manipulate condition
+consumer 1 triggered
+ending consumer 1
+consumer 0 triggered
+ending consumer 0
+```
+
+## Queue
+
+`asyncio.Queue` 为 conroutines 实现了一个先进先出的数据结构，类似多线程中的 `queue.Queue`，或者多进程中的 `multiprocessing.Queue`
+
+```py
+# asyncio_queue.py
+
+import asyncio
+
+
+async def consumer(n, _queue):
+    """:type _queue asyncio.Queue"""
+    # print('consumer {}: waiting for item'.format(n))
+    while True:
+        print('consumer {}: waiting for item'.format(n))
+        item = await _queue.get()
+        print('consumer {}: has item {}'.format(n, item))
+        if item is None:
+            _queue.task_done()
+            break
+        else:
+            await asyncio.sleep(.01 * item)
+            _queue.task_done()
+    print('consumer {}: ending'.format(n))
+
+
+async def producer(_queue, workers):
+    """:type _queue asyncio.Queue"""
+    print('producer: starting')
+
+    for i in range(workers * 3):
+        await _queue.put(i)
+        print('producer: add task {} to queue'.format(i))
+
+    print('producer: adding stop signals to the queue')
+    for i in range(workers):
+        await _queue.put(None)
+    print('producer: waiting for queue to empty')
+    await _queue.join()
+    print('producer: ending')
+
+
+async def main(loop, _consumers):
+    queue = asyncio.Queue(maxsize=_consumers)
+    consumers = [loop.create_task(consumer(i, queue)) for i in range(_consumers)]
+    prod = loop.create_task(producer(queue, _consumers))
+    await asyncio.wait(consumers + [prod])
+
+
+event_loop = asyncio.get_event_loop()
+event_loop.run_until_complete(main(event_loop, 2))
+event_loop.close()
+```
+
+通过 `put()` 方法添加项或者通过 `get()` 移除项都是异步操作，同时有可能队列大小到达指令大小（阻塞添加操作）或者队列变空（阻塞所有获取项的调用）。
+
+```
+consumer 0: waiting for item
+consumer 1: waiting for item
+producer: starting
+producer: add task 0 to queue
+producer: add task 1 to queue
+consumer 0: has item 0
+consumer 1: has item 1
+producer: add task 2 to queue
+producer: add task 3 to queue
+consumer 0: waiting for item
+consumer 0: has item 2
+producer: add task 4 to queue
+consumer 1: waiting for item
+consumer 1: has item 3
+producer: add task 5 to queue
+producer: adding stop signals to the queue
+consumer 0: waiting for item
+consumer 0: has item 4
+consumer 1: waiting for item
+consumer 1: has item 5
+producer: waiting for queue to empty
+consumer 0: waiting for item
+consumer 0: has item None
+consumer 0: ending
+consumer 1: waiting for item
+consumer 1: has item None
+consumer 1: ending
+producer: ending
+```
