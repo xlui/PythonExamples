@@ -993,3 +993,215 @@ consumer 1: has item None
 consumer 1: ending
 producer: ending
 ```
+
+# 通过 Asyncio 实现一个 echo 服务器与客户端程序
+
+## echo 服务端程序
+
+首先需要导入一些模块，设置 asyncio 和 logging，然后创建事件循环对象：
+
+```py
+# echo_server.py
+
+import asyncio
+import logging
+import sys
+
+SERVER_ADDRESS = ('localhost', 10000)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s %(name)s: %(message)s',
+    stream=sys.stderr
+)
+logger = logging.getLogger('main')
+event_loop = asyncio.get_event_loop()
+```
+
+然后定义一个继承 `asyncio.Protocol` 的子类，用来处理与客户端之间的通信。Protocol 的方法是基于服务端 socket 事件触发的。
+
+```py
+class EchoServer(asyncio.Protocol):
+```
+
+每当有一个新的客户端连接的时候，就会调用 `connection_made` 方法：
+
+```py
+def connection_made(self, transport):
+```
+
+`transport` 参数是一个 `asyncio.Transport` 实例对象，这个对象抽象了一系列使用 socket 进行异步 I/O 操作的方法。不同的通信协议提供了不同的 transport 实现，但是它们都有同样的 API。比如，有一些 transport 类用来与 socket 通信，有些用来跟子进程通过管道通信。
+
+可以通过 `get_extra_info()` 获取进来的客户端的地址信息：
+
+```py
+def connection_made(self, transport):
+    """:type transport asyncio.Transport"""
+    self.transport = transport
+    self.address = transport.get_extra_info('peername')
+    fmt = 'EchoServer_{}_{}'.format(*self.address)
+    self.log = logging.getLogger(fmt)
+    self.log.debug('connection accepted')
+```
+
+连接建立后，当有数据从客户端发送到服务器的时候会使用传输过来的数据调用 `data_received` 方法：
+
+```py
+def data_received(self, data):
+    self.log.debug('received {}'.format(data))
+    self.transport.write(data)
+    self.log.debug('sent {}'.format(data))
+```
+
+一些 transport 支持一个特殊的 EOF 标识符。当遇到一个 EOF 的时候，`eof_received()` 方法会被调用。在本例中，EOF 会被发送给客户端，表示这个信号已经被接收到。因为不是所有的 transport 都支持这个 EOF，这个协议会首先询问 transport 是否可以安全的发送 EOF：
+
+```py
+def eof_received(self):
+    self.log.debug('received EOF')
+    if self.transport.can_write_eof():
+        self.transport.write_eof()
+```
+
+当一个连接被关闭的时候，无论是正常关闭还是因为一个错误导致的关闭，协议的 `connection_lost()` 方法都会调用，如果是因为出错，参数中会包含一个相关的异常对象，否则这个对象就是 None：
+
+```py
+def connection_lost(self, exc):
+    if exc:
+        self.log.error('Error: {}'.format(exc))
+    else:
+        self.log.debug('closing')
+    super().connection_lost(exc)
+```
+
+需要两步来启动这个服务器。首先，应用告诉事件循环通过使用 Protocol 类和 hostname 以及 port 信息创建一个新的 Server 对象。`create_server()` 方法是一个 coroutine，所以它的结果必须通过事件循环来得到。这个 coroutine 完成的时候返回一个与事件循环相关的 `asyncio.Server` 实例（`asyncio.AbstractServer`）。
+
+```py
+factory = event_loop.create_server(EchoServer, *SERVER_ADDRESS)
+server = event_loop.run_until_complete(factory) # type: asyncio.AbstractServer
+logger.debug('start up on {} port {}'.format(*SERVER_ADDRESS))
+```
+
+然后这个事件循环需要被运行，以便接受客户端请求以及处理相关事件。
+
+对于一个长时间运行的服务器程序来说，`run_forever()` 方法是最简便的实现这个功能的方法。
+
+无论是通过应用程序代码还是通过进程信号关闭事件循环，server 都可以被关闭以便能够正确的清理 socket 资源。
+
+```py
+try:
+    event_loop.run_forever()
+finally:
+    logger.debug('closing server')
+    server.close()
+    print(type(server))
+    event_loop.run_until_complete(server.wait_closed())
+    logger.debug('closing event loop')
+    event_loop.close()
+```
+
+## echo 客户端
+
+使用 Protocol 类实现一个客户端的代码与服务器类似。
+
+```py
+# echo_client.py
+
+import asyncio
+import functools
+import logging
+import sys
+
+MESSAGES = [
+    b'This is the message',
+    b'It will be sent',
+    b'in parts.',
+]
+SERVER_ADDRESS = ('localhost', 10000)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s %(name)s: %(message)s',
+    stream=sys.stderr
+)
+logger = logging.getLogger('main')
+event_loop = asyncio.get_event_loop()
+```
+
+客户端 Protocol 类定义了与服务器端相同的方法，但是是不同的实现。
+
+future 参数是一个 `asyncio.Future` 实例，用来作为客户端已经完成了一次接收来自服务器端操作的信号。
+
+```py
+class EchoClient(asyncio.Protocol):
+    def __init__(self, messages, future):
+        """
+        :type messages list
+        :type future asyncio.Future
+        """
+        super(EchoClient, self).__init__()
+        self.messages = messages
+        self.log = logging.getLogger('EchoClient')
+        self.future = future
+```
+
+当客户端成功连接到服务器时，会立即开始通信。客户端一次发送了一堆数据，因为网络原因可能会把多个消息合并到一个消息中。当所有的消息都送达的时候，将发送一个 EOF。
+
+虽然看起来所有的数据都立即被发送了，事实上 transport 对象会缓冲发出去的数据并且会设置一个回调来传输最终的数据，当 socket 的缓冲区准备好可以发送的时候会调用这个回调。这些都是 transport 实现的，所以应用代码可以按照 I/O 操作就像看起来那么发生的样子来实现。
+
+```py
+def connection_made(self, transport):
+    """:type transport asyncio.Transport"""
+    self.transport = transport
+    self.address = transport.get_extra_info('peername')
+    fmt = 'connecting to {} port {}'.format(*self.address)
+    self.log.debug(fmt)
+
+    for msg in self.messages:
+        transport.write(msg)
+        self.log.debug('sending {}'.format(msg))
+
+    if transport.can_write_eof():
+        transport.write_eof()
+```
+
+当接收到来自服务器的响应时，会把这个响应记录下来。
+
+```py
+def data_received(self, data):
+    self.log.debug('received {}'.format(data))
+```
+
+无论收到 EOF 还是服务器断开了连接，本地 transport 对象都将关闭并且 future 对象会通过设置一个结果值的方式标记为已完成。
+
+```py
+def eof_received(self):
+    self.log.debug('received EOF')
+    self.transport.close()
+    if not self.future.done():
+        self.future.set_result(True)
+
+def connection_lost(self, exc):
+    self.log.debug('server closed connection')
+    self.transport.close()
+    if not self.future.done():
+        self.future.set_result(True)
+    super().connection_lost(exc)
+```
+
+创建所需的 future，以及客户端 coroutine
+
+```py
+_future = asyncio.Future()
+_factory = functools.partial(EchoClient, messages=MESSAGES, future=_future)
+_coroutine = event_loop.create_connection(_factory, *SERVER_ADDRESS)
+```
+
+然后使用两次 wait 来处理客户端发送完成并退出的操作。
+
+```py
+logger.debug('waiting for client to complete')
+try:
+    event_loop.run_until_complete(_coroutine)
+    event_loop.run_until_complete(_future)
+finally:
+    logger.debug('closing event loop')
+    event_loop.close()
+```
